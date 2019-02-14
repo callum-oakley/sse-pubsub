@@ -5,39 +5,58 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 )
 
 var (
 	dataPrefix = []byte("data: ")
 	dataSuffix = []byte("\n\n")
-	subs       = map[string]map[chan []byte]bool{}
 )
 
-func subscribe(channel string) (chan []byte, func()) {
+type bus struct {
+	sync.RWMutex
+	subs map[string]map[chan []byte]bool
+}
+
+func (b *bus) subscribe(channel string) (chan []byte, func()) {
+	b.Lock()
+	defer b.Unlock()
+
 	sub := make(chan []byte)
-	if _, ok := subs[channel]; !ok {
-		subs[channel] = map[chan []byte]bool{}
+	if _, ok := b.subs[channel]; !ok {
+		b.subs[channel] = map[chan []byte]bool{}
 	}
-	subs[channel][sub] = true
+	b.subs[channel][sub] = true
+
 	return sub, func() {
-		delete(subs[channel], sub)
-		if len(subs[channel]) == 0 {
-			delete(subs, channel)
+		b.Lock()
+		defer b.Unlock()
+
+		delete(b.subs[channel], sub)
+		if len(b.subs[channel]) == 0 {
+			delete(b.subs, channel)
 		}
 	}
 }
 
-func publish(channel string, data []byte) {
-	for sub := range subs[channel] {
+func (b *bus) publish(channel string, data []byte) {
+	b.RLock()
+	defer b.RUnlock()
+
+	for sub := range b.subs[channel] {
 		sub <- data
 	}
 }
 
-func get(w http.ResponseWriter, req *http.Request) {
+type server struct {
+	b bus
+}
+
+func (s *server) get(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Type", "text/event-stream")
 
-	sub, close := subscribe(req.URL.Path)
+	sub, close := s.b.subscribe(req.URL.Path)
 	defer close()
 
 	for data := range sub {
@@ -52,32 +71,33 @@ func get(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func post(w http.ResponseWriter, req *http.Request) {
+func (s *server) post(w http.ResponseWriter, req *http.Request) {
 	data, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		w.WriteHeader(400)
 		return
 	}
 
-	publish(req.URL.Path, data)
+	s.b.publish(req.URL.Path, data)
 	w.WriteHeader(200)
 }
 
-func handler(w http.ResponseWriter, req *http.Request) {
+func (s *server) handler(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	switch req.Method {
 	case "GET":
-		get(w, req)
+		s.get(w, req)
 	case "POST":
-		post(w, req)
+		s.post(w, req)
 	default:
 		w.WriteHeader(404)
 	}
 }
 
 func main() {
+	s := server{b: bus{subs: map[string]map[chan []byte]bool{}}}
 	addr := ":" + os.Getenv("PORT")
 	log.Println("listening on", addr)
-	log.Fatal(http.ListenAndServe(addr, http.HandlerFunc(handler)))
+	log.Fatal(http.ListenAndServe(addr, http.HandlerFunc(s.handler)))
 }
